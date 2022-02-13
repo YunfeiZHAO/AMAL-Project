@@ -1,9 +1,3 @@
-defaults:
-  - _self_
-  - algorithm: PPO/pendulum
-  - hyperparam_opt: empty
-  - override hydra/sweeper: basic
-
 seed: 0
 steps: 200000
 model:
@@ -12,16 +6,18 @@ model:
 reinforcement:
   discount: 0.99
   trace_decay: 0.9
-  learning_rate: 0.0003
+  learning_rate: 3.0e-05
   ppo_clip: 0.25
-  ppo_epochs: 20
+  ppo_epochs: 10
   value_loss_coeff: 0.5
   entropy_loss_coeff: 0.001
   max_grad_norm: 0.5
 imitation:
   state_only: false
+  epochs: 15
+  learning_rate: 3.0e-05
 training:
-  batch_size: 4096
+  batch_size: 1024
 evaluation:
   interval: 20000
   episodes: 30
@@ -29,10 +25,7 @@ evaluation:
 save_trajectories: false
 render: false
 check_time_usage: false
-
-# Run/sweep directories
-hydra:
-  run:
-    dir: ./outputs/${env_type}_${algorithm}/${now:%m-%d_%H-%M-%S}
-  sweep:
-    dir: ./outputs/sweeper_${env_type}_${algorithm}/${now:%m-%d_%H-%M-%S}
+env_type: ant
+env_name: ant-bullet-medium-v0
+algorithm: RED
+sweeping: false

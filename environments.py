@@ -43,7 +43,7 @@ class D4RLEnv():
     def action_space(self):
         return self.env.action_space
 
-    def get_dataset(self, size=0, subsample=20):
+    def get_dataset(self, size=0, subsample=100):
         dataset = self.env.get_dataset()
         N = dataset['rewards'].shape[0]
         dataset_out = {'states': torch.as_tensor(dataset['observations'][:-1], dtype=torch.float32),

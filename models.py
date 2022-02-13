@@ -92,9 +92,9 @@ class Critic(nn.Module):
 
 class ActorCritic(nn.Module):
     """Definition of Soft Actor Critor class"""
-    def __init__(self, state_size, action_size, hidden_size, activation_function='tanh', log_std_dev_init=-0.5, dropout=0):
+    def __init__(self, state_size, action_size, hidden_size, activation_function='tanh', log_std_init=-0.5, dropout=0):
         super().__init__()
-        self.actor = Actor(state_size, action_size, hidden_size, activation_function=activation_function, log_std_dev_init=log_std_dev_init, dropout=dropout)
+        self.actor = Actor(state_size, action_size, hidden_size, activation_function=activation_function, log_std_init=log_std_init, dropout=dropout)
         self.critic = Critic(state_size, hidden_size, activation_function=activation_function)
 
     def forward(self, state):

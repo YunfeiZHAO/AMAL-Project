@@ -10,11 +10,15 @@ from tqdm import tqdm
 
 from environments import ENVS, TransitionDataset
 
-from models import Actor, ActorCritic, GAILDiscriminator, REDDiscriminator
+from models import ActorCritic, GAILDiscriminator, REDDiscriminator
 from train import adversarial_imitation_update, ppo_update, target_estimation_update
+
+from torch.utils.tensorboard import SummaryWriter
+
 
 def flatten_list_dicts(list_dicts):
     return {k: torch.cat([d[k] for d in list_dicts], dim=0) for k in list_dicts[-1].keys()}
+
 
 @hydra.main(config_path='conf', config_name='config')
 def main(cfg: DictConfig) -> None:
@@ -25,6 +29,12 @@ def main(cfg: DictConfig) -> None:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
+    # Tensorboard initialisation
+    subsample = 100
+    outdir = str(subsample) + "/" +cfg.env_type + "/" + cfg.algorithm
+    print(outdir)
+    writer = SummaryWriter(outdir)
+
     # Set up environment
     env = ENVS[cfg.env_type](cfg.env_name)
     env.seed(cfg.seed)
@@ -32,11 +42,11 @@ def main(cfg: DictConfig) -> None:
     state_size, action_size = env.observation_space.shape[0], env.action_space.shape[0]
 
     # Set up agent
-    agent = ActorCritic(state_size, action_size, cfg.model.hidden_size, log_std_dev_init=cfg.model.log_std_dev_init)
+    agent = ActorCritic(state_size, action_size, cfg.model.hidden_size, log_std_init=cfg.model.log_std_dev_init)
     agent_optimiser = optim.Adam(agent.parameters(), lr=cfg.reinforcement.learning_rate)
     # Set up imitation learning components
 
-    if cfg.algorithm =='GAIL':
+    if cfg.algorithm == 'GAIL':
         discriminator = GAILDiscriminator(state_size, action_size, cfg.model.hidden_size,
                                           state_only=cfg.imitation.state_only)
     elif cfg.algorithm == 'RED':
@@ -45,15 +55,17 @@ def main(cfg: DictConfig) -> None:
     discriminator_optimiser = optim.Adam(discriminator.parameters(), lr=cfg.imitation.learning_rate)
 
     # Metrics
-    metrics = dict(train_steps=[], train_returns=[], test_steps=[], test_returns=[])
+    metrics = dict()
     recent_returns = deque(maxlen=cfg.evaluation.average_window)  # Stores most recent evaluation returns
 
     # Main training loop
-    state, terminal, train_return, trajectories = env.reset(), False, 0, []
-    if cfg.algorithm in ['GAIL']: policy_trajectory_replay_buffer = deque(
-        maxlen=cfg.imitation.replay_size)
+    state, terminal, intrinsic_reture, extrinsic_return, trajectories = env.reset(), False, torch.tensor([0.0]), 0, []
+    if cfg.algorithm == 'GAIL':
+        policy_trajectory_replay_buffer = deque(maxlen=cfg.imitation.replay_size)
     pbar = tqdm(range(1, cfg.steps + 1), unit_scale=1, smoothing=0)
-    if cfg.check_time_usage: start_time = time.time()  # Performance tracking
+    if cfg.check_time_usage:
+        start_time = time.time()  # Performance tracking
+    episode = 1
     for step in pbar:
         # Perform initial training (if needed)
         if step == 1:
@@ -75,7 +87,7 @@ def main(cfg: DictConfig) -> None:
             action = policy.sample()
             log_prob_action = policy.log_prob(action)
             next_state, reward, terminal = env.step(action)
-            train_return += reward
+            extrinsic_return += reward
             trajectories.append(
                 dict(states=state, actions=action, rewards=torch.tensor([reward], dtype=torch.float32),
                      terminals=torch.tensor([terminal], dtype=torch.float32), log_prob_actions=log_prob_action,
@@ -83,11 +95,13 @@ def main(cfg: DictConfig) -> None:
             state = next_state
 
         if terminal:
-            # Store metrics and reset environment
-            metrics['train_steps'].append(step)
-            metrics['train_returns'].append([train_return])
-            pbar.set_description(f'Step: {step} | Return: {train_return}')
-            state, train_return = env.reset(), 0
+            # Store metrics, tensorboard and reset environment
+            writer.add_scalars('reward', {'intrinsic': intrinsic_reture.mean() * 100,
+                                          'extrinsic': extrinsic_return}, episode)
+
+            pbar.set_description(f'Step: {step} | Return: {extrinsic_return}')
+            state, extrinsic_return = env.reset(), 0
+            episode += 1
 
         # Update models
         if len(trajectories) >= cfg.training.batch_size:
@@ -103,15 +117,15 @@ def main(cfg: DictConfig) -> None:
                     adversarial_imitation_update(cfg.algorithm, agent, discriminator, expert_trajectories,
                                                  TransitionDataset(policy_trajectory_replays),
                                                  discriminator_optimiser, cfg.training.batch_size,
-                                                 cfg.imitation.r1_reg_coeff, cfg.get('pos_class_prior', 0.5),
-                                                 cfg.get('nonnegative_margin', 0))
+                                                 cfg.imitation.r1_reg_coeff)
 
-                # Predict rewards
-                states, actions, next_states, terminals = policy_trajectories['states'], policy_trajectories[
-                    'actions'], torch.cat([policy_trajectories['states'][1:], next_state]), policy_trajectories[
-                                                              'terminals']
-                with torch.inference_mode():
-                        policy_trajectories['rewards'] = discriminator.predict_reward(states, actions)
+            # Predict rewards
+            states, actions, next_states, terminals = policy_trajectories['states'], policy_trajectories[
+                'actions'], torch.cat([policy_trajectories['states'][1:], next_state]), policy_trajectories[
+                                                          'terminals']
+            with torch.inference_mode():
+                policy_trajectories['rewards'] = discriminator.predict_reward(states, actions)
+            intrinsic_reture = policy_trajectories['rewards']
 
             # Perform PPO updates (includes GAE re-estimation with updated value function)
             for _ in tqdm(range(cfg.reinforcement.ppo_epochs), leave=False):
@@ -121,24 +135,12 @@ def main(cfg: DictConfig) -> None:
                            cfg.reinforcement.max_grad_norm)
             trajectories, policy_trajectories = [], None
 
-
-        # Evaluate agent and plot metrics
-        if step % cfg.evaluation.interval == 0 and not cfg.check_time_usage:
-            test_returns = evaluate_agent(agent, cfg.evaluation.episodes, ENVS[cfg.env_type], cfg.env_name, cfg.seed)
-            recent_returns.append(sum(test_returns) / cfg.evaluation.episodes)
-            metrics['test_steps'].append(step)
-            metrics['test_returns'].append(test_returns)
-            lineplot(metrics['test_steps'], metrics['test_returns'], 'test_returns')
-           if len(metrics['train_returns']) > 0:  # Plot train returns if any
-                lineplot(metrics['train_steps'], metrics['train_returns'], 'train_returns')
-
     if cfg.check_time_usage:
         metrics['training_time'] = time.time() - start_time
 
     # Save agent and metrics
     torch.save(agent.state_dict(), 'agent.pth')
     torch.save(discriminator.state_dict(), 'discriminator.pth')
-    torch.save(metrics, 'metrics.pth')
 
     env.close()
     return sum(recent_returns) / float(cfg.evaluation.average_window)
